@@ -20,7 +20,7 @@ elif [ -f /etc/redhat-release ]; then
     yum install python3 python3-pip curl -y
 fi
 
-# 3. 从 GitHub 下载你最新的核心文件 (已完美匹配你的 refs/heads/main 结构)
+# 3. 从 GitHub 下载你最新的核心文件
 RAW_URL="https://raw.githubusercontent.com/kingsnakerrr/aliyun-traffic-control/refs/heads/main"
 
 echo "📥 正在从 GitHub 下载最新程序..."
@@ -66,7 +66,6 @@ systemctl restart traffic-control.service
 echo "⏱️  正在配置 Crontab 每分钟静默保活..."
 CRON_CMD="* * * * * $WORKDIR/venv/bin/python $WORKDIR/traffic_control.py >> $WORKDIR/cron_run.log 2>&1"
 # 清理可能存在的旧路径配置，并追加新路径的保活任务
-(crontab -l 2>/dev/null | grep -Fv "traffic_control.py"; echo "$CMD") | crontab - 2>/dev/null || true
 (crontab -l 2>/dev/null | grep -Fv "traffic_control.py"; echo "$CRON_CMD") | crontab -
 
 echo "=================================================="
