@@ -1,0 +1,16 @@
+[Unit]
+Description=Aliyun Traffic Control + Telegram Bot Service
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=root
+WorkingDirectory=/root/aliyun-traffic-control
+ExecStart=/root/aliyun-traffic-control/venv/bin/python /root/aliyun-traffic-control/traffic_control.py
+Restart=always
+RestartSec=10
+Environment=PYTHONUNBUFFERED=1
+
+[Install]
+WantedBy=multi-user.target

@@ -1,0 +1,21 @@
+#!/usr/bin/env bash
+set -e
+BASE_DIR="/root/aliyun-traffic-control"
+SERVICE_NAME="traffic-control.service"
+CRON_LINE="* * * * * ${BASE_DIR}/venv/bin/python ${BASE_DIR}/traffic_control.py --cron >> ${BASE_DIR}/cron_run.log 2>&1"
+need_root(){ [ "$(id -u)" -eq 0 ] || { echo "请使用 root 用户运行"; exit 1; }; }
+pause(){ echo; read -r -p "按回车返回菜单..." _; }
+service_status(){ systemctl status "$SERVICE_NAME" -l --no-pager || true; }
+start_bot(){ systemctl start "$SERVICE_NAME"; echo "已启动 TG Bot 服务"; }
+stop_bot(){ systemctl stop "$SERVICE_NAME"; echo "已停止 TG Bot 服务"; }
+restart_bot(){ systemctl restart "$SERVICE_NAME"; echo "已重启 TG Bot 服务"; }
+enable_keepalive(){ touch "${BASE_DIR}/keepalive_enabled.flag"; echo "已开启自动保活"; }
+disable_keepalive(){ rm -f "${BASE_DIR}/keepalive_enabled.flag"; echo "已关闭自动保活"; }
+restart_keepalive(){ touch "${BASE_DIR}/keepalive_enabled.flag"; "${BASE_DIR}/venv/bin/python" "${BASE_DIR}/traffic_control.py" --cron; echo "已执行一次保活检查"; }
+show_last_logs(){ echo "===== cron_run.log 最近20行 ====="; tail -n 20 "${BASE_DIR}/cron_run.log" 2>/dev/null || echo "暂无 cron_run.log"; echo; echo "===== systemd 最近20行 ====="; journalctl -u "$SERVICE_NAME" -n 20 --no-pager || true; }
+live_logs(){ echo "实时日志：Ctrl+C 退出"; tail -n 20 -f "${BASE_DIR}/cron_run.log"; }
+edit_config(){ ${EDITOR:-nano} "${BASE_DIR}/traffic_control.py"; echo "修改完成后建议重启服务：systemctl restart traffic-control"; }
+uninstall_all(){ echo "即将完全卸载程序"; read -r -p "确定卸载？输入 yes 继续: " ans; [ "$ans" = "yes" ] || { echo "已取消"; return; }; systemctl stop "$SERVICE_NAME" 2>/dev/null || true; systemctl disable "$SERVICE_NAME" 2>/dev/null || true; rm -f "/etc/systemd/system/${SERVICE_NAME}"; systemctl daemon-reload || true; crontab -l 2>/dev/null | grep -vF "$CRON_LINE" | crontab - || true; rm -f /usr/local/bin/cdt; rm -rf "$BASE_DIR"; echo "卸载完成"; exit 0; }
+menu(){ clear; echo "=============================="; echo " 阿里云 CDT 流量控制菜单"; echo "=============================="; echo "1. 查看服务状态"; echo "2. 启动 TG Bot 服务"; echo "3. 停止 TG Bot 服务"; echo "4. 重启 TG Bot 服务"; echo "5. 开启自动保活"; echo "6. 关闭自动保活"; echo "7. 重启/立即执行一次保活检查"; echo "8. 查看最近20行日志"; echo "9. 查看实时 cron 日志"; echo "10. 编辑配置文件"; echo "11. 完全卸载程序"; echo "0. 退出"; echo "=============================="; }
+main(){ need_root; while true; do menu; read -r -p "请输入选项: " c; case "$c" in 1) service_status; pause;; 2) start_bot; pause;; 3) stop_bot; pause;; 4) restart_bot; pause;; 5) enable_keepalive; pause;; 6) disable_keepalive; pause;; 7) restart_keepalive; pause;; 8) show_last_logs; pause;; 9) live_logs; pause;; 10) edit_config; pause;; 11) uninstall_all;; 0) exit 0;; *) echo "无效选项"; pause;; esac; done; }
+main "$@"
