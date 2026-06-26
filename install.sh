@@ -1,161 +1,76 @@
 #!/bin/bash
-set -e
+# ====================================================================
+# 阿里云 CDT 流量控制与 TG 机器人系统 - 一键安装与环境对齐脚本 (完美版)
+# ====================================================================
 
-WORKDIR="/root/aliyun-cdt-traffic-control"
-RAW_URL="https://raw.githubusercontent.com/kingsnakerrr/aliyun-traffic-control/refs/heads/main"
-
-# ==================================================
-# 🧹 内置一键卸载清理函数
-# ==================================================
-all_uninstall_process() {
-    echo "=================================================="
-    echo "🧹 开始彻底卸载阿里云 CDT 流控系统..."
-    echo "=================================================="
-    pkill -f traffic_control.py || true
-    systemctl stop traffic-control.service 2>/dev/null || true
-    systemctl disable traffic-control.service 2>/dev/null || true
-    rm -f /etc/systemd/system/traffic-control.service
-    systemctl daemon-reload
-    (crontab -l 2>/dev/null | grep -Fv "traffic_control.py") | crontab -
-    rm -rf /root/aliyun-traffic-control
-    rm -rf "$WORKDIR"
-    rm -f /usr/local/bin/cdt
-    rm -f /root/install.sh
-    echo "✅ 卸载完成！所有残留、定时任务、全局命令已被斩草除根。"
-    echo "=================================================="
-}
-
-if [ "$1" = "--uninstall" ]; then
-    all_uninstall_process
-    exit 0
+# 确保脚本以 root 权限运行
+if [ "$EUID" -ne 0 ]; then
+  echo "❌ 请使用 root 权限运行此脚本！"
+  exit 1
 fi
 
-# ==================================================
-# 🌐 一键安装流程
-# ==================================================
-echo "=================================================="
-echo "🚀 欢迎使用 阿里云 CDT 双版本流控断网保活系统"
-echo "=================================================="
-echo "💡 请选择操作："
-echo "  1) 阿里云国内版 安装/重装"
-echo "  2) 阿里云国际版 安装/重装"
-echo "  3) 彻底卸载此系统"
-read -p "请输入数字 [1-3]: " MAIN_CHOICE
+echo "⏱️ 1. 正在清理老机器上的旧进程与旧服务项..."
+systemctl stop traffic-control.service 2>/dev/null
+systemctl disable traffic-control.service 2>/dev/null
+rm -f /etc/systemd/system/traffic-control.service
+systemctl daemon-reload
+pkill -f "traffic_control.py" || true
 
-if [ "$MAIN_CHOICE" = "3" ]; then
-    all_uninstall_process
-    exit 0
-elif [ "$MAIN_CHOICE" = "2" ]; then
-    echo "✅ 已选择：阿里云国际版"
-    ENDPOINT_REG="ap-southeast-1"
-    SET_INTERNATIONAL="True"
+# 清理旧的 crontab 定时任务（防止路径和参数冲突）
+crontab -l 2>/dev/null | grep -v "traffic_control" | crontab -
+
+echo "⏱️ 2. 正在创建全新代码对应的标准工作目录..."
+TARGET_DIR="/root/aliyun-cdt-traffic-control"
+mkdir -p "$TARGET_DIR"
+
+# 检查当前目录下是否有用户放好的 traffic_control.py
+if [ -f "./traffic_control.py" ]; then
+    cp "./traffic_control.py" "$TARGET_DIR/traffic_control.py"
+    echo "✅ 已成功将当前的 traffic_control.py 移至工作目录。"
+elif [ -f "$TARGET_DIR/traffic_control.py" ]; then
+    echo "ℹ️ 工作目录中已存在 traffic_control.py，将直接使用。"
 else
-    echo "✅ 已选择：阿里云国内版"
-    ENDPOINT_REG="cn-hangzhou"
-    SET_INTERNATIONAL="False"
-fi
-echo "=================================================="
-
-# 先创建好工作目录
-mkdir -p "$WORKDIR"
-
-echo "📦 正在检查 system 依赖并拉取核心备份..."
-if [ -f /etc/debian_version ]; then
-    apt-get update && apt-get install python3-venv python3-pip curl -y
-elif [ -f /etc/redhat-release ]; then
-    yum install python3 python3-pip curl -y
+    echo "⚠️ 未在当前目录找到 traffic_control.py！请确保该文件稍后被正确放置在 $TARGET_DIR/traffic_control.py"
 fi
 
-# ✨【终极修复】直接从 GitHub 抓一份最新的 install.sh 塞进工作目录，100% 避开本地路径查找 Bug！
-curl -sSL "$RAW_URL/install.sh" -o "$WORKDIR/install.sh"
-chmod +x "$WORKDIR/install.sh"
-
-# 切入工作目录开始后面的部署
-cd "$WORKDIR"
-
-echo "📥 正在从 GitHub 下载最新程序..."
-curl -sSL "$RAW_URL/traffic_control.py" -o traffic_control.py
-curl -sSL "$RAW_URL/traffic-control.service" -o /etc/systemd/system/traffic-control.service
-
-sed -i "s|/root/aliyun-traffic-control|$WORKDIR|g" /etc/systemd/system/traffic-control.service
-
-echo "⚙️ 正在创建 Python 虚拟环境并安装双版本完整依赖..."
+echo "⏱️ 3. 正在构建 Python 虚拟环境并安装全新依赖库..."
+cd "$TARGET_DIR"
 python3 -m venv venv
-./venv/bin/pip install --upgrade pip
-./venv/bin/pip install aliyun-python-sdk-core aliyun-python-sdk-ecs aliyun-python-sdk-bssopenapi requests python-telegram-bot==13.15
+source venv/bin/activate
 
-echo ""
-echo "=================================================="
-echo "✏️  请配置你的主程序关键参数！"
-echo "=================================================="
-read -p "请输入你的 阿里云 ACCESS_KEY_ID: " AK_ID
-read -p "请输入你的 阿里云 ACCESS_KEY_SECRET: " AK_SECRET
-read -p "请输入你要控制的 阿里云实例ID (如 i-j6cxxxxxx): " INST_ID
-read -p "请输入该实例所在的 地域ID (默认: cn-hongkong): " REG_ID
-REG_ID=${REG_ID:-cn-hongkong}
-read -p "请输入你的 Telegram BOT_TOKEN: " TG_TOKEN
-read -p "请输入你的 Telegram CHAT_ID (频道/群组ID): " TG_ID
+# 升级 pip 并精准安装新旧组合依赖，特别加上新版必需的 python-telegram-bot 库
+pip install --upgrade pip
+pip install aliyun-python-sdk-core aliyun-python-sdk-ecs aliyun-python-sdk-bssopenapi requests python-telegram-bot==13.15
 
-# 精准注入 Python
-sed -i "s/ACCESS_KEY_ID = .*/ACCESS_KEY_ID = '$AK_ID'/g" traffic_control.py
-sed -i "s/ACCESS_KEY_SECRET = .*/ACCESS_KEY_SECRET = '$AK_SECRET'/g" traffic_control.py
-sed -i "s/INSTANCE_ID = .*/INSTANCE_ID = '$INST_ID'/g" traffic_control.py
-sed -i "s/REGION_ID = .*/REGION_ID = '$REG_ID'/g" traffic_control.py
-sed -i "s/TELEGRAM_BOT_TOKEN = .*/TELEGRAM_BOT_TOKEN = '$TG_TOKEN'/g" traffic_control.py
-sed -i "s/TELEGRAM_CHAT_ID = .*/TELEGRAM_CHAT_ID = '$TG_ID'/g" traffic_control.py
-sed -i "s/BILL_REG_ID = .*/BILL_REG_ID = '$ENDPOINT_REG'/g" traffic_control.py
-sed -i "s/IS_INTERNATIONAL = .*/IS_INTERNATIONAL = $SET_INTERNATIONAL/g" traffic_control.py
+echo "⏱️ 4. 正在自动生成并配置最新的系统常驻服务 (traffic-control.service)..."
+cat << 'EOF' > /etc/systemd/system/traffic-control.service
+[Unit]
+Description=Aliyun CDT Traffic Control + Telegram Bot Service
+After=network.target
 
-# 6. 生成全局快捷控制脚本 /usr/local/bin/cdt
-cat << 'EOF' > /usr/local/bin/cdt
-#!/bin/bash
-WORKDIR="/root/aliyun-cdt-traffic-control"
+[Service]
+Type=simple
+User=root
+WorkingDirectory=/root/aliyun-cdt-traffic-control
+ExecStart=/root/aliyun-cdt-traffic-control/venv/bin/python traffic_control.py
+Restart=always
+RestartSec=10
+Environment=PYTHONUNBUFFERED=1
 
-show_menu() {
-    echo "=================================================="
-    echo "🛠️  阿里云 CDT 流控保活系统控制面板"
-    echo "=================================================="
-    echo "  1) 🟢 启动/重启 TG机器人保活监听"
-    echo "  2) 🔴 停止 TG机器人保活监听"
-    echo "  3) 📊 查看每分钟流控与熔断日志"
-    echo "  4) 🧹 彻底卸载并清理残留"
-    echo "  5) 🚪 退出面板"
-    echo "=================================================="
-    read -p "请选择操作 [1-5]: " PANEL_CHOICE
-    case $PANEL_CHOICE in
-        1) systemctl restart traffic-control.service && echo "✅ 机器人后台监听已重新启动！" ;;
-        2) systemctl stop traffic-control.service && echo "🛑 机器人后台监听已停止！" ;;
-        3) tail -n 20 "$WORKDIR/cron_run.log" ; echo "" ; read -p "按回车继续..." ;;
-        4) bash "$WORKDIR/install.sh" --uninstall ; exit 0 ;;
-        *) exit 0 ;;
-    esac
-}
-
-if [ "$1" = "--uninstall" ]; then
-    bash "$WORKDIR/install.sh" --uninstall
-else
-    show_menu
-fi
+[Install]
+WantedBy=multi-user.target
 EOF
-chmod +x /usr/local/bin/cdt
 
-echo "✅ 全局控制指令 cdt 已成功植入系统！"
+echo "⏱️ 5. 正在自动配置新版带有 --cron 参数的每分钟定时流控检查..."
+(crontab -l 2>/dev/null | grep -v "traffic_control" ; echo "* * * * * /root/aliyun-cdt-traffic-control/venv/bin/python /root/aliyun-cdt-traffic-control/traffic_control.py --cron >> /root/aliyun-cdt-traffic-control/cron_run.log 2>&1") | crontab -
 
-# 7. 启动常驻服务
-echo "🤖 正在启动 Telegram 机器人常驻后台服务..."
+echo "⏱️ 6. 正在刷新系统服务并拉起全新的机器人程序..."
 systemctl daemon-reload
 systemctl enable traffic-control.service
-systemctl restart traffic-control.service
+systemctl start traffic-control.service
 
-# 8. 挂载 Crontab
-echo "⏱️  正在配置 Crontab 每分钟静默保活与流量熔断检查..."
-CRON_CMD="* * * * * $WORKDIR/venv/bin/python $WORKDIR/traffic_control.py --cron >> $WORKDIR/cron_run.log 2>&1"
-(crontab -l 2>/dev/null | grep -Fv "traffic_control.py"; echo "$CRON_CMD") | crontab -
-
-echo "=================================================="
-echo "🎉 阿里云 CDT 全功能终极控制系统部署完毕！"
-echo "🛡️  180G 流量硬熔断守护中。"
-echo "💡 提示：您现在可以在任何路径，直接输入以下命令管理系统："
-echo "     👉 输入 cdt            : 呼出可视化控制面板 (启动/停止/看日志/卸载)"
-echo "     👉 输入 cdt --uninstall: 瞬间全自动一键秒卸载"
-echo "=================================================="
+echo "===================================================================="
+echo "🟢 恭喜！全新的 CDT 流量控制系统与 TG 常驻机器人已全部部署完毕。"
+echo "📂 代码与运行环境路径: $TARGET_DIR"
+echo "🔍 你可以使用命令查看机器人状态: systemctl status traffic-control.service"
+echo "===================================================================="
