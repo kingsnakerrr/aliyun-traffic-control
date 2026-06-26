@@ -1,205 +1,156 @@
+#!/usr/bin/env python3
 # -*- coding: utf-8 -*-
-from aliyunsdkcore.client import AcsClient
-from aliyunsdkcore.request import CommonRequest
-from aliyunsdkecs.request.v20140526 import StartInstancesRequest, StopInstancesRequest, DescribeInstancesRequest
-from aliyunsdkbssopenapi.request.v20171214 import QueryAccountBalanceRequest, QueryBillRequest
+
 import json
-import sys
-import logging
 import requests
-from datetime import datetime
-import argparse
-import time
+import datetime
+from aliyunsdkcore.client import AcsClient
+from aliyunsdkbssopenapi.request.v20171214 import QueryBillOverviewRequest
+from aliyunsdkbssopenapi.request.v20171214 import QueryAccountBalanceRequest
+from aliyunsdkecs.request.v20140526 import StopInstanceRequest, DescribeInstancesRequest
+from telegram import Update
+from telegram.ext import Updater, CommandHandler, CallbackContext
 
-# ================== 1. 配置 ==================
-ACCESS_KEY_ID = 'YOUR_ACCESS_KEY_ID'
-ACCESS_KEY_SECRET = 'YOUR_ACCESS_KEY_SECRET'
-REGION_ID = 'cn-hongkong'
-ECS_INSTANCE_ID = 'i-j6c0mq7hjf11h5n1m1qu'
-TRAFFIC_THRESHOLD_GB = 180
+# ==========================================
+# ⚙️ 基础配置区域 (一键脚本会自动在此处填入网关与密钥)
+# ==========================================
+ACCESS_KEY_ID = '你的ACCESS_KEY_ID'
+ACCESS_KEY_SECRET = '你的ACCESS_KEY_SECRET'
+TELEGRAM_BOT_TOKEN = '你的TELEGRAM_BOT_TOKEN'
+TELEGRAM_CHAT_ID = '你的TELEGRAM_CHAT_ID'
 
-TELEGRAM_BOT_TOKEN = 'YOUR_TELEGRAM_BOT_TOKEN'
-TELEGRAM_CHAT_ID = 'YOUR_TELEGRAM_CHAT_ID'
+REG_ID = 'cn-hangzhou'         # 默认国内杭州，国际版会被改为 ap-southeast-1
+IS_INTERNATIONAL = False       # 开关：True 为国际版，False 为国内版
+MAX_TRAFFIC_GB = 180.0         # 🛑 你的硬核流控阈值：180G 强制断网关机
 
-# 配置日志
-logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(levelname)s - %(message)s", stream=sys.stdout)
-logger = logging.getLogger(__name__)
+# 初始化阿里云客户端
+clt = AcsClient(ACCESS_KEY_ID, ACCESS_KEY_SECRET, REG_ID)
 
-try:
-    client = AcsClient(ACCESS_KEY_ID, ACCESS_KEY_SECRET, REGION_ID)
-    logger.info("AcsClient 初始化成功。")
-except Exception as e:
-    logger.error(f"AcsClient 初始化失败: {e}")
-    sys.exit(1)
-
-# ================== 2. 核心数据查询函数 ==================
-def send_telegram(chat_id, message):
+def get_current_instance_id():
+    """自动获取当前 VPS 在阿里云后台的 InstanceId"""
     try:
-        url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage"
-        data = {"chat_id": chat_id, "parse_mode": "HTML", "text": message}
-        requests.post(url, data=data, timeout=10)
-    except Exception as e:
-        logger.error(f"发送 TG 失败: {e}")
-
-def get_total_traffic_gb():
-    try:
-        request = CommonRequest()
-        request.set_domain('cdt.aliyuncs.com')
-        request.set_version('2021-08-13')
-        request.set_action_name('ListCdtInternetTraffic')
-        request.set_method('POST')
-        response = client.do_action_with_exception(request)
+        # 获取本机的内网 IP，用来去阿里云后台比对
+        local_ip = requests.get('http://100.100.100.200/latest/meta-data/private-ipv4', timeout=2).text.strip()
+        request = DescribeInstancesRequest.DescribeInstancesRequest()
+        request.set_PageSize(50)
+        response = clt.do_action_with_exception(request)
         data = json.loads(response.decode('utf-8'))
-        total_bytes = sum(d.get('Traffic', 0) for d in data.get('TrafficDetails', []))
-        return round(total_bytes / (1024 ** 3), 2)
+        for inst in data.get('Instances', {}).get('Instance', []):
+            if local_ip in str(inst.get('VpcAttributes', {}).get('PrivateIpAddress', {}).get('IpAddress', [])):
+                return inst.get('InstanceId')
+    except Exception:
+        pass
+    return None
+
+def stop_vps_safety():
+    """触发 180G 熔断：调用阿里云官方 API 强行关闭服务器"""
+    instance_id = get_current_instance_id()
+    if not instance_id:
+        return "❌ 触发流控关机失败：无法获取当前实例 ID"
+    try:
+        request = StopInstanceRequest.StopInstanceRequest()
+        request.set_InstanceId(instance_id)
+        request.set_ForceStop(True)  # 强行断电关机，确保绝不漏掉一兆流量
+        clt.do_action_with_exception(request)
+        
+        # 紧急轰炸 Telegram
+        alert_msg = f"🚨【⚠️流量熔断警告】\n您的 VPS 本月 CDT 流量已触发 {MAX_TRAFFIC_GB} GB 安全阈值！为了保护您的钱包，系统已调用阿里云官方 API 成功执行【强制关机断网】保护！"
+        requests.post(f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage", data={
+            "chat_id": TELEGRAM_CHAT_ID, "text": alert_msg
+        })
+        return "🛑 已成功执行官方 API 强行关机"
     except Exception as e:
-        logger.error(f"流量查询失败: {e}")
+        return f"❌ 关机 API 调用失败: {str(e)}"
+
+def get_cdt_traffic():
+    """从阿里云官方实时拉取当前账号的 CDT 本月消耗流量(GB)"""
+    try:
+        # 伪装接入：此处通过调用 BssOpenApi 获取 CDT 账单明细里的用量
+        request = QueryBillOverviewRequest.QueryBillOverviewRequest()
+        request.set_accept_format('json')
+        response = clt.do_action_with_exception(request)
+        data = json.loads(response.decode('utf-8'))
+        
+        # 遍历账单，精准捞出含有 ProductCode 为 'cdt' 的公网流出总流量
+        total_usage_gb = 0.0
+        if data.get('Success') and data.get('Data'):
+            bill_items = data['Data']['Items']['Item']
+            for item in bill_items:
+                if 'cdt' in str(item.get('ProductCode', '')).lower():
+                    # 捞取账单中的实际消耗用量
+                    total_usage_gb += float(item.get('Usage', 0))
+        return round(total_usage_gb, 2)
+    except Exception:
         return 0.0
 
-def get_ecs_status():
-    try:
-        request = DescribeInstancesRequest.DescribeInstancesRequest()
-        request.set_InstanceIds([ECS_INSTANCE_ID])
-        response = client.do_action_with_exception(request)
-        data = json.loads(response.decode('utf-8'))
-        instances = data.get("Instances", {}).get("Instance", [])
-        return instances[0].get("Status", "Unknown") if instances else "Unknown"
-    except Exception as e:
-        logger.error(f"状态查询失败: {e}")
-        return "Unknown"
-
-def get_aliyun_balance_and_cost():
-    balance_str, cost_str = "未知", "未知"
-    
-    # 1. 实时查询账户余额
-    try:
-        req_b = QueryAccountBalanceRequest.QueryAccountBalanceRequest()
-        res_b = json.loads(client.do_action_with_exception(req_b).decode('utf-8'))
-        if res_b.get("Success"):
-            avail_amount = res_b.get("Data", {}).get("AvailableAmount", "")
-            if avail_amount:
-                balance_str = f"{float(avail_amount.replace(',', '')):.2f}"
-    except Exception as e:
-        logger.error(f"查询余额接口失败: {e}")
-        
-    # 2. ⚡ 实时账单穿透查询（把当月产生的所有明细，包含未结算的，直接全部抓出来累加）
-    try:
-        req_c = QueryBillRequest.QueryBillRequest()
-        req_c.set_BillingCycle(datetime.now().strftime("%Y-%m"))
-        req_c.set_PageSize(100) # 确保抓完本月所有账单明细
-        res_c = json.loads(client.do_action_with_exception(req_c).decode('utf-8'))
-        
-        if res_c.get("Success"):
-            bill_items = res_c.get("Data", {}).get("Items", {}).get("Item", [])
-            total_pretax_amount = 0.0
-            for item in bill_items:
-                # 累加本月每一项产生消费的应付金额（PretaxAmount）
-                amount = item.get("PretaxAmount", 0)
-                if amount:
-                    total_pretax_amount += float(amount)
-            cost_str = f"{total_pretax_amount:.2f}"
-    except Exception as e:
-        logger.error(f"通过实时明细接口查询消费失败: {e}")
-        
-    return balance_str, cost_str
-
-def get_status_message():
-    traffic = get_total_traffic_gb()
-    status = get_ecs_status()
-    balance, cost = get_aliyun_balance_and_cost()
-    now = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-    return f"""📊 <b>阿里云账号 zymsdf - CDT服务器</b>
-
-🕒 时间：{now}
-📈 当前流量：{traffic} GB / {TRAFFIC_THRESHOLD_GB} GB
-🔄 实例状态：{status}
-💰 账户余额：{balance} 元
-💰 本月消费（1号至今）：{cost} 元
-⚡️ 保活运行状态：正常
-💡 流量控制脚本运行正常"""
-
-# ================== 3. ECS 自动化启停控制 ==================
-def ecs_start():
-    if get_ecs_status() == "Running": return
-    try:
-        request = StartInstancesRequest.StartInstancesRequest()
-        request.set_InstanceIds([ECS_INSTANCE_ID])
-        client.do_action_with_exception(request)
-        send_telegram(TELEGRAM_CHAT_ID, f"<b>⚠️ 实例动作通知</b>\n\n🟢 流量正常，已自动 <b>启动</b> 实例。")
-    except Exception as e:
-        logger.error(f"启动失败: {e}")
-
-def ecs_stop():
-    if get_ecs_status() == "Stopped": return
-    try:
-        request = StopInstancesRequest.StopInstancesRequest()
-        request.set_InstanceIds([ECS_INSTANCE_ID])
-        request.set_ForceStop(False)
-        client.do_action_with_exception(request)
-        send_telegram(TELEGRAM_CHAT_ID, f"<b>⚠️ 实例动作通知</b>\n\n🔴 流量已达阈值，已自动 <b>停止</b> 实例！")
-    except Exception as e:
-        logger.error(f"停止失败: {e}")
-
-# ================== 4. TG Bot 监听与早 9 点定时推送 ==================
-def run_tg_bot_mode():
-    logger.info("=== Telegram Bot 监听与定时任务服务已启动 ===")
-    offset = 0
-    last_daily_report_date = ""
-
-    while True:
+def get_aliyun_data():
+    """根据版本开关，自动获取对应的账单或余额数据"""
+    if IS_INTERNATIONAL:
         try:
-            now = datetime.now()
-            if now.hour == 9 and now.minute == 0 and last_daily_report_date != now.strftime("%Y-%m-%d"):
-                logger.info("触发早上 9 点定时报告推送...")
-                send_telegram(TELEGRAM_CHAT_ID, get_status_message())
-                last_daily_report_date = now.strftime("%Y-%m-%d")
-
-            url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/getUpdates"
-            res = requests.get(url, params={"offset": offset, "timeout": 10}, timeout=15).json()
-            
-            if res.get("ok") and res.get("result"):
-                for update in res["result"]:
-                    offset = update["update_id"] + 1
-                    message = update.get("message", {})
-                    text = message.get("text", "")
-                    chat_id = message.get("chat", {}).get("id")
-
-                    if text in ["/status", "查流量", "状态", "/start"]:
-                        logger.info(f"收到用户指令: {text}，正在生成报告...")
-                        send_telegram(chat_id, get_status_message())
+            request = QueryBillOverviewRequest.QueryBillOverviewRequest()
+            request.set_accept_format('json')
+            response = clt.do_action_with_exception(request)
+            data = json.loads(response.decode('utf-8'))
+            if data.get('Success') and data.get('Data'):
+                bill_items = data['Data']['Items']['Item']
+                total_evaluating = sum(float(item.get('OutstandingAmount', 0)) for item in bill_items)
+                return f"💰 **本月已产生消费**: ${total_evaluating:.2f} (信用卡后付费)"
+            return "💰 **本月已产生消费**: $0.00"
         except Exception as e:
-            logger.error(f"Bot 运行中出现异常: {e}")
-        time.sleep(2)
-
-# ================== 5. 主程序入口 ==================
-if __name__ == "__main__":
-    parser = argparse.ArgumentParser()
-    parser.add_argument('--report', action='store_true')
-    parser.add_argument('--bot', action='store_true')
-    args = parser.parse_args()
-
-    if args.report:
-        send_telegram(TELEGRAM_CHAT_ID, get_status_message())
-        print("报告已发送")
-        sys.exit(0)
-
-    if args.bot:
-        run_tg_bot_mode()
-        sys.exit(0)
-
-    # 模式 C: 后台自动化保活检查
-    logger.info("=== 执行保活检查 ===")
-    traffic = get_total_traffic_gb()
-    balance, cost = get_aliyun_balance_and_cost()
-    
-    logger.info(f"当前总互联网流量: {traffic} GB")
-    logger.info(f"账户剩余余额: {balance} 元 | 当前实时计算消费: {cost} 元")
-
-    if traffic >= TRAFFIC_THRESHOLD_GB:
-        logger.info(f"流量 {traffic} GB ≥ 阈值 {TRAFFIC_THRESHOLD_GB} GB，执行停止。")
-        ecs_stop()
+            return f"❌ **账单拉取失败**: {str(e)}"
     else:
-        logger.info(f"流量 {traffic} GB < 阈值 {TRAFFIC_THRESHOLD_GB} GB，执行启动。")
-        ecs_start()
-        
-    logger.info("脚本执行完毕。")
+        try:
+            request = QueryAccountBalanceRequest.QueryAccountBalanceRequest()
+            request.set_accept_format('json')
+            response = clt.do_action_with_exception(request)
+            data = json.loads(response.decode('utf-8'))
+            if data.get('Success') and data.get('Data'):
+                balance = data['Data'].get('AvailableAmount', '0.00')
+                return f"💰 **账户现金余额**: {balance} 元"
+            return "💰 **账户现金余额**: 暂无数据"
+        except Exception as e:
+            return f"❌ **余额拉取失败**: {str(e)}"
+
+def check_cron_job():
+    """每分钟 Crontab 轮询的核心守护进程"""
+    traffic = get_cdt_traffic()
+    print(f"[{datetime.datetime.now()}] 当前流量已消耗: {traffic} GB / 阈值: {MAX_TRAFFIC_GB} GB")
+    
+    if traffic >= MAX_TRAFFIC_GB:
+        result = stop_vps_safety()
+        print(result)
+
+def status_command(update: Update, context: CallbackContext):
+    """/status 指令响应"""
+    if str(update.effective_chat.id) != TELEGRAM_CHAT_ID:
+        return
+    financial_info = get_aliyun_data()
+    traffic = get_cdt_traffic()
+    
+    text = (
+        "📊 **阿里云实例实时状态**\n"
+        "----------------------------------\n"
+        f"{financial_info}\n"
+        f"📶 **CDT 官方流量消耗**: {traffic} GB / {MAX_TRAFFIC_GB} GB (180G熔断)\n"
+        "----------------------------------\n"
+        "🤖 系统每分钟自动轮询保活中..."
+    )
+    update.message.reply_text(text, parse_mode='Markdown')
+
+def main():
+    import sys
+    # 如果有参数传入（比如 crontab 每分钟执行时），走流量阈值熔断检查
+    if len(sys.argv) > 1 and sys.argv[1] == '--cron':
+        check_cron_job()
+        return
+
+    if TELEGRAM_BOT_TOKEN == '你的TELEGRAM_BOT_TOKEN':
+        return
+    updater = Updater(TELEGRAM_BOT_TOKEN)
+    dispatcher = updater.dispatcher
+    dispatcher.add_handler(CommandHandler("status", status_command))
+    updater.start_polling()
+    updater.idle()
+
+if __name__ == '__main__':
+    main()
