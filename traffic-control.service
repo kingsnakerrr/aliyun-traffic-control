@@ -1,0 +1,16 @@
+[Unit]
+Description=Aliyun Traffic Control + Telegram Bot Service
+After=network.target
+
+[Service]
+Type=simple
+User=root
+WorkingDirectory=/root/aliyun-traffic-control
+# 核心：使用 venv 运行并带上 --bot 参数，启动 TG 交互和早 9 点推送
+ExecStart=/root/aliyun-traffic-control/venv/bin/python traffic_control.py --bot
+Restart=always
+RestartSec=10
+Environment=PYTHONUNBUFFERED=1
+
+[Install]
+WantedBy=multi-user.target
