@@ -39,13 +39,16 @@ INSTANCE_ID = '__INSTANCE_ID__'
 REGION_ID = '__REGION_ID__'
 
 # 账单接口区域，国内账号一般 cn-hangzhou
-BILL_REG_ID = '__BILL_REG_ID__'
+BILL_REG_ID = 'cn-hangzhou'
 
 # 国际版设 True，国内版设 False
 IS_INTERNATIONAL = __IS_INTERNATIONAL__
 
 # 流量阈值 GB
 MAX_TRAFFIC_GB = __MAX_TRAFFIC_GB__
+
+# 状态报告里的账号显示名称
+ACCOUNT_NAME = '__ACCOUNT_NAME__'
 
 # 保活开关文件
 KEEPALIVE_FLAG_FILE = '/root/aliyun-traffic-control/keepalive_enabled.flag'
@@ -350,7 +353,7 @@ def build_status_text():
     keep_status = "正常" if keepalive_enabled() else "已暂停"
 
     return (
-        "📊 阿里云账号 zymsdf - CDT服务器\n\n"
+        f"📊 阿里云账号 {ACCOUNT_NAME} - CDT服务器\n\n"
         "----------------------------------\n"
         f"🕒 时间：{now_text()}\n"
         f"📈 当前流量：{traffic} GB / {MAX_TRAFFIC_GB} GB\n"
@@ -623,6 +626,10 @@ def main():
         check_cron_job()
         return
 
+    if len(sys.argv) > 1 and sys.argv[1] == '--report':
+        send_tg(TELEGRAM_CHAT_ID, build_status_text())
+        return
+
     if TELEGRAM_BOT_TOKEN == '你的TG机器人TOKEN':
         logging.error("请先配置 TELEGRAM_BOT_TOKEN")
         return
@@ -650,16 +657,10 @@ def main():
     dispatcher.add_handler(CommandHandler("keepon", keepon_command))
     dispatcher.add_handler(CommandHandler("keepoff", keepoff_command))
     dispatcher.add_handler(CommandHandler("report", report_command))
-
-    updater.job_queue.run_daily(
-        send_daily_report,
-        time=datetime.time(hour=9, minute=0, second=0)
-    )
-
     updater.start_polling(clean=True)
 
     logging.info(
-        "Telegram Bot 已启动：私聊控制，9点报告/保活/关机通知发送频道。"
+        "Telegram Bot 已启动：私聊控制，日报由 crontab 定时发送，保活/关机通知发送频道。"
     )
 
     updater.idle()
