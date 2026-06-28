@@ -5,9 +5,9 @@ import os
 import sys
 import json
 import logging
-import datetime
-import requests
+from datetime import datetime, timedelta, timezone
 
+import requests
 from aliyunsdkcore.client import AcsClient
 from aliyunsdkcore.request import CommonRequest
 from aliyunsdkbssopenapi.request.v20171214 import QueryBillOverviewRequest
@@ -15,21 +15,18 @@ from aliyunsdkbssopenapi.request.v20171214 import QueryAccountBalanceRequest
 from aliyunsdkecs.request.v20140526 import StartInstanceRequest
 from aliyunsdkecs.request.v20140526 import StopInstanceRequest
 from aliyunsdkecs.request.v20140526 import DescribeInstancesRequest
-
 from telegram import Update
 from telegram.ext import Updater, CommandHandler, CallbackContext
 from telegram.ext.dispatcher import run_async
 
-
 # =========================
 # 基础配置：这里必须改成你自己的真实信息
 # =========================
-
 ACCESS_KEY_ID = '__ACCESS_KEY_ID__'
 ACCESS_KEY_SECRET = '__ACCESS_KEY_SECRET__'
 TELEGRAM_BOT_TOKEN = '__TELEGRAM_BOT_TOKEN__'
 
-# 频道 ID：9点日报、保活恢复成功、流量熔断关机通知都发这里
+# 频道 ID：日报、保活恢复成功、流量熔断关机通知都发这里
 TELEGRAM_CHAT_ID = '__TELEGRAM_CHAT_ID__'
 
 # 你的 TG 私聊 ID：机器人只接受这个用户私聊命令
@@ -39,16 +36,23 @@ INSTANCE_ID = '__INSTANCE_ID__'
 REGION_ID = '__REGION_ID__'
 
 # 账单接口区域，国内账号一般 cn-hangzhou
-BILL_REG_ID = 'cn-hangzhou'
+BILL_REG_ID = '__BILL_REG_ID__'
 
 # 国际版设 True，国内版设 False
 IS_INTERNATIONAL = __IS_INTERNATIONAL__
 
 # 流量阈值 GB
-MAX_TRAFFIC_GB = __MAX_TRAFFIC_GB__
+MAX_TRAFFIC_GB = float(__MAX_TRAFFIC_GB__)
 
 # 状态报告里的账号显示名称
 ACCOUNT_NAME = '__ACCOUNT_NAME__'
+
+# 每日报告推送时间，固定按北京时间 UTC+8 判断，不依赖机器时区
+DAILY_REPORT_TIME = '__DAILY_REPORT_TIME__'
+
+# 月初自动恢复检测时间：每月 1 号 00:05:00 UTC+8 之后才允许恢复因流量熔断关机的实例
+MONTHLY_RESET_OPEN_HOUR = 0
+MONTHLY_RESET_OPEN_MINUTE = 5
 
 # 保活开关文件
 KEEPALIVE_FLAG_FILE = '/root/aliyun-traffic-control/keepalive_enabled.flag'
@@ -56,60 +60,99 @@ KEEPALIVE_FLAG_FILE = '/root/aliyun-traffic-control/keepalive_enabled.flag'
 # 通知状态文件：避免同一种状态每分钟刷屏
 LAST_NOTIFY_FILE = '/root/aliyun-traffic-control/last_notify_state.json'
 
-
 # =========================
 # 日志
 # =========================
-
 logging.basicConfig(
     level=logging.INFO,
     format='%(asctime)s - %(levelname)s - %(message)s'
 )
 
+# =========================
+# 时间函数：全部按北京时间 UTC+8
+# =========================
+CN_TZ = timezone(timedelta(hours=8))
+
+
+def now_cn():
+    return datetime.now(CN_TZ)
+
+
+def now_text():
+    return now_cn().strftime('%Y-%m-%d %H:%M:%S UTC+8')
+
+
+def today_cn_str():
+    return now_cn().strftime('%Y-%m-%d')
+
+
+def get_billing_cycle():
+    return now_cn().strftime('%Y-%m')
+
+
+def get_report_hour_minute():
+    try:
+        hour_s, minute_s = DAILY_REPORT_TIME.strip().split(':', 1)
+        return int(hour_s), int(minute_s)
+    except Exception:
+        return 9, 0
+
+
+def is_daily_report_time():
+    hour, minute = get_report_hour_minute()
+    now = now_cn()
+    return now.hour == hour and now.minute == minute
+
+
+def daily_report_key():
+    return f'daily_report_{today_cn_str()}'
+
+
+def is_month_reset_open_window():
+    """每月 1 号 00:05 UTC+8 之后，允许检测并自动恢复因流量熔断关机的实例。"""
+    now = now_cn()
+    return now.day == 1 and (
+        now.hour > MONTHLY_RESET_OPEN_HOUR or
+        (now.hour == MONTHLY_RESET_OPEN_HOUR and now.minute >= MONTHLY_RESET_OPEN_MINUTE)
+    )
+
+
+def get_next_cdt_reset_check_time():
+    now = now_cn()
+    if now.month == 12:
+        nxt = datetime(now.year + 1, 1, 1, MONTHLY_RESET_OPEN_HOUR, MONTHLY_RESET_OPEN_MINUTE, 0, tzinfo=CN_TZ)
+    else:
+        nxt = datetime(now.year, now.month + 1, 1, MONTHLY_RESET_OPEN_HOUR, MONTHLY_RESET_OPEN_MINUTE, 0, tzinfo=CN_TZ)
+    return nxt.strftime('%Y-%m-%d %H:%M:%S UTC+8')
 
 # =========================
 # 阿里云客户端
 # =========================
-
 clt_ecs = AcsClient(ACCESS_KEY_ID, ACCESS_KEY_SECRET, REGION_ID)
 clt_bill = AcsClient(ACCESS_KEY_ID, ACCESS_KEY_SECRET, BILL_REG_ID)
-
 
 # =========================
 # 通用函数
 # =========================
-
-def get_billing_cycle():
-    return datetime.datetime.now().strftime('%Y-%m')
-
-
-def now_text():
-    return datetime.datetime.now().strftime('%Y-%m-%d %H:%M:%S')
-
-
 def send_tg(chat_id, text, parse_mode=None):
     try:
         data = {
-            "chat_id": chat_id,
-            "text": text
+            'chat_id': chat_id,
+            'text': text
         }
         if parse_mode:
-            data["parse_mode"] = parse_mode
-
+            data['parse_mode'] = parse_mode
         res = requests.post(
-            f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage",
+            f'https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage',
             data=data,
             timeout=10
         )
-
         if not res.ok:
-            logging.error(f"TG发送失败: {res.text}")
+            logging.error(f'TG发送失败: {res.text}')
             return False
-
         return True
-
     except Exception as e:
-        logging.error(f"发送TG失败: {str(e)}")
+        logging.error(f'发送TG失败: {str(e)}')
         return False
 
 
@@ -148,19 +191,20 @@ def load_notify_state():
 def save_notify_state(state):
     try:
         with open(LAST_NOTIFY_FILE, 'w') as f:
-            json.dump(state, f)
+            json.dump(state, f, ensure_ascii=False, indent=2)
     except Exception as e:
-        logging.error(f"保存通知状态失败: {str(e)}")
+        logging.error(f'保存通知状态失败: {str(e)}')
 
 
 def notify_once(key, text):
     state = load_notify_state()
     if state.get(key):
-        return
-
+        return False
     if send_tg(TELEGRAM_CHAT_ID, text):
         state[key] = now_text()
         save_notify_state(state)
+        return True
+    return False
 
 
 def clear_notify_key(key):
@@ -170,157 +214,132 @@ def clear_notify_key(key):
         save_notify_state(state)
 
 
+def has_notify_key(key):
+    return bool(load_notify_state().get(key))
+
+
 def set_pending_keepalive(status):
     state = load_notify_state()
-    state["keepalive_pending"] = {
-        "time": now_text(),
-        "status": status
+    state['keepalive_pending'] = {
+        'time': now_text(),
+        'status': status
     }
     save_notify_state(state)
 
 
 def get_pending_keepalive():
     state = load_notify_state()
-    return state.get("keepalive_pending")
+    return state.get('keepalive_pending')
 
 
 def clear_pending_keepalive():
     state = load_notify_state()
-    if "keepalive_pending" in state:
-        del state["keepalive_pending"]
+    if 'keepalive_pending' in state:
+        del state['keepalive_pending']
         save_notify_state(state)
-
 
 # =========================
 # ECS 状态与控制
 # =========================
-
 def get_vps_status():
     if not INSTANCE_ID or '你的' in INSTANCE_ID:
-        return "Unknown"
-
+        return 'Unknown'
     try:
         request = DescribeInstancesRequest.DescribeInstancesRequest()
         request.set_InstanceIds([INSTANCE_ID])
-
         response = clt_ecs.do_action_with_exception(request)
         data = json.loads(response.decode('utf-8'))
-
-        instances = data.get("Instances", {}).get("Instance", [])
+        instances = data.get('Instances', {}).get('Instance', [])
         if not instances:
-            return "Unknown"
-
-        return instances[0].get("Status", "Unknown")
-
+            return 'Unknown'
+        return instances[0].get('Status', 'Unknown')
     except Exception as e:
-        logging.error(f"查询实例状态失败: {str(e)}")
-        return "Unknown"
+        logging.error(f'查询实例状态失败: {str(e)}')
+        return 'Unknown'
 
 
 def start_vps_safety():
     if not INSTANCE_ID or '你的' in INSTANCE_ID:
-        return False, "❌ INSTANCE_ID 未配置"
-
+        return False, '❌ INSTANCE_ID 未配置'
     try:
         status = get_vps_status()
         status_l = status.lower()
+        if status_l == 'running':
+            return True, '✅ 实例已经是 Running，无需开机'
+        if status_l in ['starting', 'stopping']:
+            return True, f'⏳ 实例当前是 {status}，正在变化中，等待恢复 Running'
 
-        if status_l == "running":
-            return True, "✅ 实例已经是 Running，无需开机"
-
-        if status_l in ["starting", "stopping"]:
-            return True, f"⏳ 实例当前是 {status}，正在变化中，等待恢复 Running"
-
-        logging.warning(">>> 已触发保活，准备调用 StartInstance()")
-
+        logging.warning('>>> 准备调用 StartInstance()')
         request = StartInstanceRequest.StartInstanceRequest()
         request.set_InstanceId(INSTANCE_ID)
         clt_ecs.do_action_with_exception(request)
-
-        logging.warning(">>> StartInstance() 调用成功")
-        return True, "🚀 StartInstance() 调用成功，实例正在启动"
-
+        logging.warning('>>> StartInstance() 调用成功')
+        return True, '✅ StartInstance() 调用成功，实例正在启动'
     except Exception as e:
-        logging.error(f"开机失败: {str(e)}")
-        return False, f"❌ 开机失败：{str(e)}"
+        logging.error(f'开机失败: {str(e)}')
+        return False, f'❌ 开机失败：{str(e)}'
 
 
 def stop_vps_safety():
     if not INSTANCE_ID or '你的' in INSTANCE_ID:
-        return False, "❌ INSTANCE_ID 未配置"
-
+        return False, '❌ INSTANCE_ID 未配置'
     try:
         status = get_vps_status()
         status_l = status.lower()
+        if status_l == 'stopped':
+            return True, '✅ 实例已经是 Stopped，无需关机'
+        if status_l == 'stopping':
+            return True, f'⏳ 实例当前是 {status}，正在关机中'
 
-        if status_l == "stopped":
-            return True, "✅ 实例已经是 Stopped，无需关机"
-
-        if status_l == "stopping":
-            return True, f"⏳ 实例当前是 {status}，正在关机中"
-
-        logging.warning(">>> 已触发流量熔断，准备调用 StopInstance()")
-
+        logging.warning('>>> 已触发流量熔断，准备调用 StopInstance()')
         request = StopInstanceRequest.StopInstanceRequest()
         request.set_InstanceId(INSTANCE_ID)
         request.set_ForceStop(True)
         clt_ecs.do_action_with_exception(request)
-
-        logging.warning(">>> StopInstance() 调用成功")
-        return True, "🛑 StopInstance() 调用成功，实例正在关机"
-
+        logging.warning('>>> StopInstance() 调用成功')
+        return True, '✅ StopInstance() 调用成功，实例正在关机'
     except Exception as e:
-        logging.error(f"关机失败: {str(e)}")
-        return False, f"❌ 关机失败：{str(e)}"
-
+        logging.error(f'关机失败: {str(e)}')
+        return False, f'❌ 关机失败：{str(e)}'
 
 # =========================
 # CDT 流量与账单
 # =========================
-
 def get_cdt_traffic():
     request = CommonRequest()
     request.set_domain('cdt.aliyuncs.com')
     request.set_version('2021-08-13')
     request.set_action_name('ListCdtInternetTraffic')
     request.set_method('POST')
-
     try:
         response = clt_ecs.do_action_with_exception(request)
         response_json = json.loads(response.decode('utf-8'))
-
         total_bytes = sum(
             d.get('Traffic', 0)
             for d in response_json.get('TrafficDetails', [])
         )
-
         total_gb = total_bytes / (1024 ** 3)
         return round(total_gb, 2)
-
     except Exception as e:
-        logging.error(f"CDT流量查询失败: {str(e)}")
+        logging.error(f'CDT流量查询失败: {str(e)}')
         return 0.0
 
 
 def get_aliyun_data():
     try:
         balance = '0.00'
-
         request_bal = QueryAccountBalanceRequest.QueryAccountBalanceRequest()
         request_bal.set_accept_format('json')
         res_bal = clt_bill.do_action_with_exception(request_bal)
         data_bal = json.loads(res_bal.decode('utf-8'))
-
         if data_bal.get('Success'):
             balance = data_bal.get('Data', {}).get('AvailableAmount', '0.00')
 
         request_bill = QueryBillOverviewRequest.QueryBillOverviewRequest()
         request_bill.set_accept_format('json')
         request_bill.set_BillingCycle(get_billing_cycle())
-
         res_bill = clt_bill.do_action_with_exception(request_bill)
         data_bill = json.loads(res_bill.decode('utf-8'))
-
         cost = 0.0
         if data_bill.get('Success') and data_bill.get('Data'):
             items = data_bill.get('Data', {}).get('Items', {}).get('Item', [])
@@ -328,186 +347,243 @@ def get_aliyun_data():
 
         if IS_INTERNATIONAL:
             return (
-                "💰 账户现金余额：信用卡后付费\n"
-                f"💵 本月消费（1号至今）：${cost:.2f}"
+                '💳 扣费方式：国际站后付费\n'
+                f'💵 本月消费（1号至今）：${cost:.2f}'
             )
-
         return (
-            f"💰 账户现金余额：{balance} 元\n"
-            f"💵 本月消费（1号至今）：{cost:.2f} 元"
+            f'💰 账户现金余额：{balance} 元\n'
+            f'💵 本月消费（1号至今）：{cost:.2f} 元'
         )
-
     except Exception as e:
-        logging.error(f"查询余额/账单失败: {str(e)}")
-        return "💰 账户现金余额：暂无数据\n💵 本月消费（1号至今）：0.00"
-
+        logging.error(f'查询余额/账单失败: {str(e)}')
+        return '💰 账户现金余额：暂无数据\n💵 本月消费（1号至今）：0.00'
 
 # =========================
 # 消息构建
 # =========================
-
 def build_status_text():
     traffic = get_cdt_traffic()
     instance_status = get_vps_status()
     financial_info = get_aliyun_data()
-    keep_status = "正常" if keepalive_enabled() else "已暂停"
-
+    keep_status = '正常' if keepalive_enabled() else '已暂停'
     return (
-        f"📊 阿里云账号 {ACCOUNT_NAME} - CDT服务器\n\n"
-        "----------------------------------\n"
-        f"🕒 时间：{now_text()}\n"
-        f"📈 当前流量：{traffic} GB / {MAX_TRAFFIC_GB} GB\n"
-        f"🔄 实例状态：{instance_status}\n"
-        f"{financial_info}\n"
-        f"⚡ 保活运行状态：{keep_status}\n"
-        "💡 流量控制脚本运行正常\n"
-        "----------------------------------"
+        f'📊 阿里云账号 {ACCOUNT_NAME} - CDT服务器\n\n'
+        '----------------------------------\n'
+        f'⏰ 时间：{now_text()}\n'
+        f'📡 当前流量：{traffic} GB / {MAX_TRAFFIC_GB:g} GB\n'
+        f'🖥 实例状态：{instance_status}\n'
+        f'{financial_info}\n'
+        f'⚡ 保活运行状态：{keep_status}\n'
+        f'📅 下次自动检测开机：{get_next_cdt_reset_check_time()}\n'
+        '✅ 流量控制脚本运行正常\n'
+        '----------------------------------'
     )
 
 
 def build_help_text():
     return (
-        "🤖 阿里云 CDT 控制机器人命令\n\n"
-        "/status - 查看完整状态\n"
-        "/traffic - 查看当前 CDT 流量\n"
-        "/bill - 查看余额和本月消费\n"
-        "/startvps - 立即开机\n"
-        "/stopvps - 立即关机\n"
-        "/keepon - 开启自动保活\n"
-        "/keepoff - 暂停自动保活\n"
-        "/report - 立即发送报告到频道\n"
-        "/help - 查看命令帮助\n\n"
-        "说明：\n"
-        "1. 机器人只接受管理员私聊命令。\n"
-        "2. 每天 9 点报告发送到频道。\n"
-        "3. 触发保活并恢复 Running 后通知频道。\n"
-        "4. 触发流量熔断关机会通知频道。"
+        '🤖 阿里云 CDT 控制机器人命令\n\n'
+        '/status - 查看完整状态\n'
+        '/traffic - 查看当前 CDT 流量\n'
+        '/bill - 查看余额和本月消费\n'
+        '/startvps - 立即开机\n'
+        '/stopvps - 立即关机\n'
+        '/keepon - 开启自动保活\n'
+        '/keepoff - 暂停自动保活\n'
+        '/report - 立即发送报告到频道\n'
+        '/help - 查看命令帮助\n\n'
+        '说明：\n'
+        '1. 机器人只接受管理员私聊命令。\n'
+        f'2. 每天 {DAILY_REPORT_TIME} 按北京时间发送日报到频道。\n'
+        '3. 触发保活并恢复 Running 后通知频道。\n'
+        '4. 触发流量熔断关机会通知频道且不会重复刷屏。\n'
+        '5. 因流量熔断关机后，每月1号00:05 UTC+8以后，若 CDT 流量低于阈值会自动开机。'
     )
 
 
 def build_keepalive_success_notice(old_status, traffic):
     return (
-        "🟢【保活恢复成功】\n\n"
-        f"之前状态：{old_status}\n"
-        "当前状态：Running\n\n"
-        f"当前 CDT 流量：{traffic} GB / {MAX_TRAFFIC_GB} GB\n"
-        f"🖥 实例：{INSTANCE_ID}\n"
-        f"🕒 时间：{now_text()}"
+        '〖保活恢复成功〗\n\n'
+        f'之前状态：{old_status}\n'
+        '当前状态：Running\n\n'
+        f'当前 CDT 流量：{traffic} GB / {MAX_TRAFFIC_GB:g} GB\n'
+        f'实例：{INSTANCE_ID}\n'
+        f'时间：{now_text()}'
     )
 
 
 def build_keepalive_action_notice(old_status, result_msg, traffic):
     return (
-        "🟡【保活已触发】\n\n"
-        f"检测到实例状态：{old_status}\n"
-        f"当前 CDT 流量：{traffic} GB / {MAX_TRAFFIC_GB} GB\n"
-        f"动作结果：{result_msg}\n\n"
-        "系统已开始救活，等待实例恢复 Running 后会再次通知。\n"
-        f"🖥 实例：{INSTANCE_ID}\n"
-        f"🕒 时间：{now_text()}"
+        '〖保活已触发〗\n\n'
+        f'检测到实例状态：{old_status}\n'
+        f'当前 CDT 流量：{traffic} GB / {MAX_TRAFFIC_GB:g} GB\n'
+        f'动作结果：{result_msg}\n\n'
+        '系统已开始救活，等待实例恢复 Running 后会再次通知。\n'
+        f'实例：{INSTANCE_ID}\n'
+        f'时间：{now_text()}'
+    )
+
+
+def build_monthly_reset_start_notice(traffic, result_msg):
+    return (
+        '〖月初流量恢复自动开机〗\n\n'
+        f'当前 CDT 流量：{traffic} GB / {MAX_TRAFFIC_GB:g} GB\n'
+        f'自动开机条件：每月1号00:05以后 且 CDT流量 < {MAX_TRAFFIC_GB:g} GB\n'
+        f'动作结果：{result_msg}\n\n'
+        '系统判断免费额度已进入新账期或流量低于保护阈值，已执行自动开机。\n'
+        f'实例：{INSTANCE_ID}\n'
+        f'时间：{now_text()}'
     )
 
 
 def build_traffic_stop_notice(traffic, result_msg):
     return (
-        "🔴【流量熔断关机通知】\n\n"
-        f"当前 CDT 流量：{traffic} GB / {MAX_TRAFFIC_GB} GB\n"
-        f"动作结果：{result_msg}\n\n"
-        "系统已执行关机保护，避免继续产生流量费用。\n"
-        f"🖥 实例：{INSTANCE_ID}\n"
-        f"🕒 时间：{now_text()}"
+        '〖流量熔断关机通知〗\n\n'
+        f'当前 CDT 流量：{traffic} GB / {MAX_TRAFFIC_GB:g} GB\n'
+        f'动作结果：{result_msg}\n\n'
+        '系统已执行关机保护，避免继续产生流量费用。\n'
+        f'下次自动检测开机：{get_next_cdt_reset_check_time()}\n'
+        f'自动开机条件：到达检测时间后 CDT流量 < {MAX_TRAFFIC_GB:g} GB\n'
+        f'实例：{INSTANCE_ID}\n'
+        f'时间：{now_text()}'
     )
 
+# =========================
+# 定时任务辅助
+# =========================
+def maybe_send_daily_report():
+    if is_daily_report_time():
+        if notify_once(daily_report_key(), build_status_text()):
+            logging.info(f'已发送每日 {DAILY_REPORT_TIME} 北京时间报告到频道。')
+    else:
+        # 清理昨天及更早日报 key，避免状态文件越来越大
+        state = load_notify_state()
+        today_key = daily_report_key()
+        old_keys = [k for k in state if k.startswith('daily_report_') and k != today_key]
+        if old_keys:
+            for key in old_keys:
+                del state[key]
+            save_notify_state(state)
+
+
+def should_block_keepalive_by_traffic_stop():
+    """因流量熔断关机后，只有每月1号00:05以后且流量低于阈值才恢复。"""
+    return has_notify_key('traffic_stop')
 
 # =========================
 # cron 保活入口
 # =========================
-
 def check_cron_job():
+    maybe_send_daily_report()
+
     traffic = get_cdt_traffic()
     status_before = get_vps_status()
     status_l = status_before.lower()
-
     logging.info(
-        f"cron检查：流量 {traffic} GB / {MAX_TRAFFIC_GB} GB，实例状态 {status_before}"
+        f'cron检查：流量 {traffic} GB / {MAX_TRAFFIC_GB:g} GB，实例状态 {status_before}'
     )
 
-    # 超流量：强制关机，并通知频道
+    # 非1号时，清理“月初自动开机通知”状态，方便下个月再次通知
+    if now_cn().day != 1:
+        clear_notify_key('monthly_reset_start')
+
+    # 超流量：强制关机，并只通知一次。不要在这里 clear traffic_stop，否则会每分钟重复通知。
     if traffic >= MAX_TRAFFIC_GB:
         ok, result = stop_vps_safety()
         logging.warning(result)
-
         notify_once(
-            "traffic_stop",
+            'traffic_stop',
             build_traffic_stop_notice(traffic, result)
         )
-
         return
-
-    clear_notify_key("traffic_stop")
 
     # 保活暂停：不自动开机，但仍保留超流量关机保护
     if not keepalive_enabled():
-        logging.info("保活已暂停，跳过自动开机。")
-        clear_notify_key("keepalive_failed")
+        logging.info('保活已暂停，跳过自动开机。')
+        clear_notify_key('keepalive_failed')
+        return
+
+    # 如果是因为流量熔断关机，必须等每月1号00:05以后且流量低于阈值才恢复
+    traffic_stopped = should_block_keepalive_by_traffic_stop()
+    if traffic_stopped:
+        if not is_month_reset_open_window():
+            logging.info('实例此前因流量熔断关机，未到每月1号00:05 UTC+8，暂不自动开机。')
+            return
+
+        ok, result = start_vps_safety()
+        logging.info(result)
+        if ok:
+            notify_once(
+                'monthly_reset_start',
+                build_monthly_reset_start_notice(traffic, result)
+            )
+            clear_notify_key('traffic_stop')
+            set_pending_keepalive(status_before)
+        else:
+            notify_once(
+                'keepalive_failed',
+                (
+                    '〖月初自动开机失败〗\n\n'
+                    f'当前 CDT 流量：{traffic} GB / {MAX_TRAFFIC_GB:g} GB\n'
+                    f'失败原因：{result}\n\n'
+                    '请检查余额、实例状态、阿里云风控或实例是否已释放。\n'
+                    f'实例：{INSTANCE_ID}\n'
+                    f'时间：{now_text()}'
+                )
+            )
         return
 
     # Running：如果之前有保活 pending，说明恢复完成，发恢复成功通知
-    if status_l == "running":
+    if status_l == 'running':
         pending = get_pending_keepalive()
         if pending:
-            old_status = pending.get("status", "Unknown")
+            old_status = pending.get('status', 'Unknown')
             send_tg(
                 TELEGRAM_CHAT_ID,
                 build_keepalive_success_notice(old_status, traffic)
             )
             clear_pending_keepalive()
-            clear_notify_key("keepalive_action")
-            clear_notify_key("keepalive_failed")
-
-        logging.info("实例 Running，保活正常。")
-        logging.info("cron脚本执行完毕。")
+            clear_notify_key('keepalive_action')
+            clear_notify_key('keepalive_failed')
+        logging.info('实例 Running，保活正常。')
+        logging.info('cron脚本执行完毕。')
         return
 
     # Starting / Stopping：过渡状态，不重复调用 StartInstance
-    if status_l in ["starting", "stopping"]:
+    if status_l in ['starting', 'stopping']:
         set_pending_keepalive(status_before)
-        logging.info(f"实例状态 {status_before}，等待状态稳定，不调用 StartInstance。")
-        logging.info("cron脚本执行完毕。")
+        logging.info(f'实例状态 {status_before}，等待状态稳定，不调用 StartInstance。')
+        logging.info('cron脚本执行完毕。')
         return
 
-    # Stopped / Unknown / 其他非 Running：触发保活启动
+    # Stopped / Unknown / 其他非 Running：普通保活启动
     ok, result = start_vps_safety()
     logging.info(result)
-
     if ok:
         set_pending_keepalive(status_before)
         notify_once(
-            "keepalive_action",
+            'keepalive_action',
             build_keepalive_action_notice(status_before, result, traffic)
         )
     else:
         set_pending_keepalive(status_before)
         notify_once(
-            "keepalive_failed",
+            'keepalive_failed',
             (
-                "🟠【保活启动失败】\n\n"
-                f"检测到实例状态：{status_before}\n"
-                f"当前 CDT 流量：{traffic} GB / {MAX_TRAFFIC_GB} GB\n"
-                f"失败原因：{result}\n\n"
-                "请检查余额、实例状态、阿里云风控或实例是否已释放。\n"
-                f"🖥 实例：{INSTANCE_ID}\n"
-                f"🕒 时间：{now_text()}"
+                '〖保活启动失败〗\n\n'
+                f'检测到实例状态：{status_before}\n'
+                f'当前 CDT 流量：{traffic} GB / {MAX_TRAFFIC_GB:g} GB\n'
+                f'失败原因：{result}\n\n'
+                '请检查余额、实例状态、阿里云风控或实例是否已释放。\n'
+                f'实例：{INSTANCE_ID}\n'
+                f'时间：{now_text()}'
             )
         )
-
-    logging.info("cron脚本执行完毕。")
-
+    logging.info('cron脚本执行完毕。')
 
 # =========================
 # Bot 命令
 # =========================
-
 @run_async
 def help_command(update: Update, context: CallbackContext):
     if not is_admin(update):
@@ -519,12 +595,10 @@ def help_command(update: Update, context: CallbackContext):
 def status_command(update: Update, context: CallbackContext):
     if not is_admin(update):
         return
-
     logging.info(
-        f"收到 /status，chat_id={get_chat_id(update)}, "
-        f"user_id={update.effective_user.id if update.effective_user else None}"
+        f'收到 /status，chat_id={get_chat_id(update)}, '
+        f'user_id={update.effective_user.id if update.effective_user else None}'
     )
-
     context.bot.send_message(chat_id=get_chat_id(update), text=build_status_text())
 
 
@@ -532,9 +606,8 @@ def status_command(update: Update, context: CallbackContext):
 def traffic_command(update: Update, context: CallbackContext):
     if not is_admin(update):
         return
-
     traffic = get_cdt_traffic()
-    text = f"📈 当前 CDT 流量：{traffic} GB / {MAX_TRAFFIC_GB} GB"
+    text = f'📡 当前 CDT 流量：{traffic} GB / {MAX_TRAFFIC_GB:g} GB'
     context.bot.send_message(chat_id=get_chat_id(update), text=text)
 
 
@@ -542,7 +615,6 @@ def traffic_command(update: Update, context: CallbackContext):
 def bill_command(update: Update, context: CallbackContext):
     if not is_admin(update):
         return
-
     context.bot.send_message(chat_id=get_chat_id(update), text=get_aliyun_data())
 
 
@@ -550,8 +622,9 @@ def bill_command(update: Update, context: CallbackContext):
 def startvps_command(update: Update, context: CallbackContext):
     if not is_admin(update):
         return
-
     ok, result = start_vps_safety()
+    if ok:
+        clear_notify_key('traffic_stop')
     context.bot.send_message(chat_id=get_chat_id(update), text=result)
 
 
@@ -559,7 +632,6 @@ def startvps_command(update: Update, context: CallbackContext):
 def stopvps_command(update: Update, context: CallbackContext):
     if not is_admin(update):
         return
-
     ok, result = stop_vps_safety()
     context.bot.send_message(chat_id=get_chat_id(update), text=result)
 
@@ -568,15 +640,13 @@ def stopvps_command(update: Update, context: CallbackContext):
 def keepon_command(update: Update, context: CallbackContext):
     if not is_admin(update):
         return
-
     set_keepalive_enabled(True)
-    clear_notify_key("keepalive_action")
-    clear_notify_key("keepalive_failed")
+    clear_notify_key('keepalive_action')
+    clear_notify_key('keepalive_failed')
     clear_pending_keepalive()
-
     context.bot.send_message(
         chat_id=get_chat_id(update),
-        text="✅ 自动保活已开启。cron 检查时，流量未超限会自动开机。"
+        text='✅ 自动保活已开启。cron 检查时，流量未超限会自动开机。'
     )
 
 
@@ -584,15 +654,13 @@ def keepon_command(update: Update, context: CallbackContext):
 def keepoff_command(update: Update, context: CallbackContext):
     if not is_admin(update):
         return
-
     set_keepalive_enabled(False)
-    clear_notify_key("keepalive_action")
-    clear_notify_key("keepalive_failed")
+    clear_notify_key('keepalive_action')
+    clear_notify_key('keepalive_failed')
     clear_pending_keepalive()
-
     context.bot.send_message(
         chat_id=get_chat_id(update),
-        text="⏸ 自动保活已暂停。cron 检查时不会自动开机，但超流量仍会关机。"
+        text='⏸ 自动保活已暂停。cron 检查时不会自动开机，但超流量仍会关机。'
     )
 
 
@@ -600,27 +668,23 @@ def keepoff_command(update: Update, context: CallbackContext):
 def report_command(update: Update, context: CallbackContext):
     if not is_admin(update):
         return
-
     send_tg(TELEGRAM_CHAT_ID, build_status_text())
-
     context.bot.send_message(
         chat_id=get_chat_id(update),
-        text="✅ 已发送完整报告到频道。"
+        text='✅ 已发送完整报告到频道。'
     )
 
 
-def send_daily_report(context: CallbackContext):
+def send_daily_report(context=None):
     try:
         send_tg(TELEGRAM_CHAT_ID, build_status_text())
-        logging.info("已发送每日9点报告到频道。")
+        logging.info('已手动发送日报到频道。')
     except Exception as e:
-        logging.error(f"每日9点报告发送失败: {str(e)}")
-
+        logging.error(f'日报发送失败: {str(e)}')
 
 # =========================
 # 主入口
 # =========================
-
 def main():
     if len(sys.argv) > 1 and sys.argv[1] == '--cron':
         check_cron_job()
@@ -631,7 +695,7 @@ def main():
         return
 
     if TELEGRAM_BOT_TOKEN == '你的TG机器人TOKEN':
-        logging.error("请先配置 TELEGRAM_BOT_TOKEN")
+        logging.error('请先配置 TELEGRAM_BOT_TOKEN')
         return
 
     if not os.path.exists(KEEPALIVE_FLAG_FILE):
@@ -647,22 +711,18 @@ def main():
     )
 
     dispatcher = updater.dispatcher
+    dispatcher.add_handler(CommandHandler('help', help_command))
+    dispatcher.add_handler(CommandHandler('status', status_command))
+    dispatcher.add_handler(CommandHandler('traffic', traffic_command))
+    dispatcher.add_handler(CommandHandler('bill', bill_command))
+    dispatcher.add_handler(CommandHandler('startvps', startvps_command))
+    dispatcher.add_handler(CommandHandler('stopvps', stopvps_command))
+    dispatcher.add_handler(CommandHandler('keepon', keepon_command))
+    dispatcher.add_handler(CommandHandler('keepoff', keepoff_command))
+    dispatcher.add_handler(CommandHandler('report', report_command))
 
-    dispatcher.add_handler(CommandHandler("help", help_command))
-    dispatcher.add_handler(CommandHandler("status", status_command))
-    dispatcher.add_handler(CommandHandler("traffic", traffic_command))
-    dispatcher.add_handler(CommandHandler("bill", bill_command))
-    dispatcher.add_handler(CommandHandler("startvps", startvps_command))
-    dispatcher.add_handler(CommandHandler("stopvps", stopvps_command))
-    dispatcher.add_handler(CommandHandler("keepon", keepon_command))
-    dispatcher.add_handler(CommandHandler("keepoff", keepoff_command))
-    dispatcher.add_handler(CommandHandler("report", report_command))
     updater.start_polling(clean=True)
-
-    logging.info(
-        "Telegram Bot 已启动：私聊控制，日报由 crontab 定时发送，保活/关机通知发送频道。"
-    )
-
+    logging.info('Telegram Bot 已启动：私聊控制，日报由 cron 按北京时间判断发送，保活/关机通知发送频道。')
     updater.idle()
 
 
